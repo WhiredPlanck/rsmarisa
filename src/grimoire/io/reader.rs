@@ -8,7 +8,7 @@
 //! including files, byte slices, and any type implementing std::io::Read.
 
 use std::fs::File;
-use std::io::{self, Read as IoRead};
+use std::io::{self, BufReader, Read as IoRead};
 use std::path::Path;
 
 /// Reader for reading binary data from various sources.
@@ -36,7 +36,9 @@ impl<'a> Reader<'a> {
     ///
     /// Returns an error if the file cannot be opened.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Reader<'static>> {
-        let file = File::open(path)?;
+        // Buffer the file: trie deserialization issues thousands of small
+        // reads, and unbuffered each one becomes a syscall.
+        let file = BufReader::new(File::open(path)?);
         Ok(Reader {
             reader: Some(Box::new(file)),
         })
@@ -55,12 +57,12 @@ impl<'a> Reader<'a> {
 
     /// Creates a reader from a byte slice.
     ///
-    /// # Arguments
-    ///
-    /// * `bytes` - Byte slice to read from
-    pub fn from_bytes(bytes: &[u8]) -> Reader<'static> {
+    /// Borrows the slice directly: the previous implementation copied the
+    /// whole slice with `to_vec()` and forged a `'static` lifetime, which both
+    /// wasted memory and was unsound for callers that passed a borrowed buffer.
+    pub fn from_bytes(bytes: &[u8]) -> Reader<'_> {
         Reader {
-            reader: Some(Box::new(io::Cursor::new(bytes.to_vec()))),
+            reader: Some(Box::new(io::Cursor::new(bytes))),
         }
     }
 

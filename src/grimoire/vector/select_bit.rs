@@ -51,26 +51,51 @@ unsafe fn select_bit_u64_pdep(i: usize, bit_id: usize, unit: u64) -> usize {
     bit_id + bit.trailing_zeros() as usize
 }
 
-/// Portable byte-table fallback for select within a 64-bit word.
+/// Portable fallback for select within a 64-bit word, used when BMI2 is
+/// unavailable.
+///
+/// Broadword implementation: byte-wise popcounts are turned into prefix sums
+/// with one multiplication, then a fixed 3-step binary search locates the
+/// target byte, and the final position comes from the lookup table. The
+/// previous implementation looped over the bytes one at a time (up to 8
+/// iterations with a branch each), which is measurably slower on the trie
+/// enumeration hot path (`select1`/`select0` are called once per trie node
+/// while walking parents in `LoudsTrie::restore_`).
 #[inline]
 fn select_bit_u64_table(i: usize, bit_id: usize, unit: u64) -> usize {
-    let mut remaining = i;
-    let mut offset = 0usize;
+    let k = i as u64 + 1; // 1-based rank of the target bit
 
-    // Process byte by byte
-    for byte_idx in 0..8 {
-        let byte = ((unit >> (byte_idx * 8)) & 0xFF) as u8;
-        let byte_popcount = byte.count_ones() as usize;
+    // Per-byte popcounts (standard broadword population count).
+    let y = unit - ((unit >> 1) & 0x5555_5555_5555_5555);
+    let y = (y & 0x3333_3333_3333_3333) + ((y >> 2) & 0x3333_3333_3333_3333);
+    let b = (y + (y >> 4)) & 0x0F0F_0F0F_0F0F_0F0F;
 
-        if remaining < byte_popcount {
-            return bit_id + offset + SELECT_TABLE[remaining][byte as usize] as usize;
+    // Prefix sums: byte j of `prefix` = sum of the popcounts of bytes 0..=j
+    // (mod 2^8; the sums fit because each byte holds at most 8).
+    let prefix = b.wrapping_mul(0x0101_0101_0101_0101);
+
+    // Binary search (fixed 3 steps) for the first byte whose prefix sum is >= k.
+    let mut lo = 0u32;
+    let mut hi = 7u32;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ((prefix >> (mid * 8)) & 0xFF) < k {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-
-        remaining -= byte_popcount;
-        offset += 8;
     }
 
-    bit_id + 63
+    // Bits before the target byte, and the rank of the bit within that byte.
+    let before = if lo == 0 {
+        0
+    } else {
+        (prefix >> ((lo - 1) * 8)) & 0xFF
+    };
+    let rank_in_byte = (k - 1 - before) as usize;
+    let byte = (unit >> (lo * 8)) as u8;
+
+    bit_id + (lo as usize) * 8 + SELECT_TABLE[rank_in_byte][byte as usize] as usize
 }
 
 /// Finds the position of the i-th set bit in a 64-bit unit.
